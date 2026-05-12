@@ -8,8 +8,42 @@ const T_LIST_ITEM = 'list_item';  // <li> break
 const T_BACKSPACE = 'backspace';  // synthetic backspace from typo correction
 
 // ─── Logger ──────────────────────────────────────────────────────────────────
-const log  = (...a) => console.log( '[AutoType]', ...a);
-const warn = (...a) => console.warn('[AutoType]', ...a);
+// Set window._autoTypeDebug = true in DevTools to enable the on-page debug panel.
+const log  = (...a) => { console.log( '[AutoType]', ...a); DocsDebugPanel.log(a); };
+const warn = (...a) => { console.warn('[AutoType]', ...a); DocsDebugPanel.log(a, 'warn'); };
+
+// ─── Docs Debug Panel ────────────────────────────────────────────────────────
+// Floating panel visible on the page when window._autoTypeDebug is truthy.
+// Lets you see insertion decisions without opening DevTools.
+const DocsDebugPanel = {
+  _el: null,
+
+  log(args, level = 'log') {
+    if (!window._autoTypeDebug) return;
+    const panel = this._panel();
+    const line = document.createElement('div');
+    line.style.color = level === 'warn' ? '#ff0' : '#0f0';
+    line.textContent = `${new Date().toISOString().slice(11, 23)} ${args.map(String).join(' ')}`;
+    panel.appendChild(line);
+    while (panel.children.length > 60) panel.removeChild(panel.firstChild);
+    panel.scrollTop = panel.scrollHeight;
+  },
+
+  _panel() {
+    if (this._el && document.body.contains(this._el)) return this._el;
+    const el = document.createElement('div');
+    el.id = 'autotype-debug-panel';
+    Object.assign(el.style, {
+      position: 'fixed', top: '0', right: '0', width: '440px', maxHeight: '280px',
+      overflow: 'auto', background: 'rgba(0,0,0,0.88)', color: '#0f0',
+      fontFamily: 'monospace', fontSize: '11px', padding: '8px',
+      zIndex: '2147483647', borderBottomLeftRadius: '6px', whiteSpace: 'pre-wrap',
+      wordBreak: 'break-all', lineHeight: '1.5',
+    });
+    document.body.appendChild(el);
+    return (this._el = el);
+  },
+};
 
 // ─── Toast ───────────────────────────────────────────────────────────────────
 function showToast(msg) {
@@ -164,89 +198,222 @@ class InsertionStrategy {
   backspace(_el) { document.execCommand('delete', false, null); }
 }
 
-// Google Docs: fire realistic keyboard + InputEvent pipeline, then execCommand for actual insertion.
-// Docs listens to beforeinput with inputType='insertText' and updates its own model accordingly;
-// the execCommand call keeps the visible contenteditable in sync.
+// ─────────────────────────────────────────────────────────────────────────────
+// GoogleDocsStrategy
+//
+// Google Docs does NOT use a visible contenteditable for text entry.  It focuses
+// a hidden <iframe class="docs-texteventtarget-iframe"> whose inner document
+// contains the real input sink.  All keyboard events must be dispatched to the
+// element inside that iframe; execCommand does NOT affect the Docs document model.
+//
+// Event pipeline per character:  keydown → beforeinput → keypress → input → keyup
+// beforeinput with inputType='insertText' is Docs' primary trigger for inserting text.
+// ─────────────────────────────────────────────────────────────────────────────
 class GoogleDocsStrategy extends InsertionStrategy {
-  insert(token, el) {
-    const editor = this._findEditor(el);
-    if (!this.verifyTarget(editor)) return false;
 
-    if (token.type === T_CHAR) {
-      this._simulateChar(token.char, editor, token.styles);
-    } else {
-      this._simulateEnter(editor);
+  // ── Input-sink discovery ─────────────────────────────────────────────────
+  // Returns { element, doc } or null.  Tries sources in priority order.
+  _findInputSink() {
+    // 1. Primary: the dedicated Docs event-capture iframe
+    const iframe = document.querySelector('iframe.docs-texteventtarget-iframe');
+    if (iframe) {
+      try {
+        const iDoc = iframe.contentDocument;
+        if (iDoc) {
+          // Use whichever element is already focused inside the iframe first
+          const iAE = iDoc.activeElement;
+          if (iAE && iAE !== iDoc.body && iAE !== iDoc.documentElement) {
+            log('Sink: iframe.activeElement →', iAE.tagName, iAE.className?.slice(0, 50));
+            return { element: iAE, doc: iDoc };
+          }
+          // Fall back to the first contenteditable inside the iframe
+          const editable = iDoc.querySelector('[contenteditable]');
+          if (editable) {
+            log('Sink: iframe[contenteditable] →', editable.tagName, editable.className?.slice(0, 50));
+            return { element: editable, doc: iDoc };
+          }
+          // Last resort: iframe body itself (Docs sometimes makes body editable)
+          log('Sink: iframe body (no contenteditable found inside iframe)');
+          return { element: iDoc.body, doc: iDoc };
+        }
+      } catch (e) {
+        warn('Cannot access iframe document:', e.message);
+      }
+    }
+
+    // 2. Selection anchor — most reliable signal of where text will land
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && sel.anchorNode) {
+      const anchor = sel.anchorNode;
+      const anchorEl = anchor.nodeType === Node.ELEMENT_NODE ? anchor : anchor.parentElement;
+      const editable = anchorEl?.closest('[contenteditable="true"]');
+      if (editable) {
+        log('Sink: selection anchor →', editable.tagName, editable.className?.slice(0, 50));
+        return { element: editable, doc: document };
+      }
+    }
+
+    // 3. document.activeElement in current frame (works when script runs inside the iframe)
+    const ae = document.activeElement;
+    if (ae && ae.isContentEditable) {
+      log('Sink: document.activeElement (contenteditable) →', ae.tagName, ae.className?.slice(0, 50));
+      return { element: ae, doc: document };
+    }
+
+    warn('Sink: none found — dumping diagnostics');
+    this.logDiagnostics();
+    return null;
+  }
+
+  // ── Diagnostics ──────────────────────────────────────────────────────────
+  logDiagnostics() {
+    log('=== DOCS DIAGNOSTICS ===');
+    log('document.activeElement:', document.activeElement?.tagName, document.activeElement?.className?.slice(0, 70));
+
+    const sel = window.getSelection();
+    if (sel) {
+      log('Selection rangeCount:', sel.rangeCount, '| collapsed:', sel.isCollapsed);
+      if (sel.anchorNode) log('  anchor:', sel.anchorNode.nodeName, JSON.stringify(sel.anchorNode.textContent?.slice(0, 30)));
+      if (sel.focusNode)  log('  focus: ', sel.focusNode.nodeName,  JSON.stringify(sel.focusNode.textContent?.slice(0, 30)));
+    }
+
+    const allCE = [...document.querySelectorAll('[contenteditable]')];
+    log(`Main-doc contenteditable count: ${allCE.length}`);
+    allCE.slice(0, 5).forEach((el, i) =>
+      log(`  [${i}]`, el.tagName, el.className?.slice(0, 50), '| isFocused:', el === document.activeElement)
+    );
+
+    const iframe = document.querySelector('iframe.docs-texteventtarget-iframe');
+    log('docs-texteventtarget-iframe present:', !!iframe);
+    if (iframe) {
+      try {
+        const iDoc = iframe.contentDocument;
+        log('  iframe.activeElement:', iDoc.activeElement?.tagName, iDoc.activeElement?.className?.slice(0, 50));
+        const iCE = [...iDoc.querySelectorAll('[contenteditable]')];
+        log(`  iframe contenteditable count: ${iCE.length}`);
+        iCE.slice(0, 3).forEach((el, i) =>
+          log(`    [${i}]`, el.tagName, el.className?.slice(0, 50))
+        );
+      } catch (e) { log('  Cannot access iframe:', e.message); }
+    }
+    log('=== END DIAGNOSTICS ===');
+  }
+
+  // ── verifyTarget ─────────────────────────────────────────────────────────
+  // For Docs the "target" concept is the iframe structure, not a specific element.
+  verifyTarget(_el) {
+    // Accept as long as we can still find an input sink
+    const sink = this._findInputSink();
+    if (!sink) {
+      warn('verifyTarget: input sink gone');
+      return false;
     }
     return true;
   }
 
-  _findEditor(fallback) {
-    // Prefer the specific Docs editor class; fall back to any contenteditable on the page.
-    return (
-      document.querySelector('.kix-appview-editor[contenteditable="true"]') ||
-      document.querySelector('[contenteditable="true"]') ||
-      fallback
-    );
+  // ── insert ───────────────────────────────────────────────────────────────
+  insert(token, _fallbackEl) {
+    const sink = this._findInputSink();
+    if (!sink) return false;
+    const { element, doc } = sink;
+
+    log(`insert type=${token.type} char=${JSON.stringify(token.char || '')} → ${element.tagName} in ${doc === document ? 'main' : 'iframe'} doc`);
+
+    if (doc.activeElement !== element) {
+      element.focus();
+      log('Refocused element before insert');
+    }
+
+    const selBefore = this._selectionOffset(doc);
+
+    if (token.type === T_CHAR) {
+      this._dispatchChar(token.char, element);
+    } else {
+      this._dispatchEnter(element);
+    }
+
+    // Verify: selection should have advanced (or at least not regressed)
+    const selAfter = this._selectionOffset(doc);
+    if (selAfter !== null && selBefore !== null && selAfter <= selBefore) {
+      warn(`Insertion may have failed: selection offset ${selBefore} → ${selAfter} for char "${token.char || ''}"`);
+    }
+
+    return true;
   }
 
-  _simulateChar(char, el, styles) {
+  // ── backspace ────────────────────────────────────────────────────────────
+  backspace(_el) {
+    const sink = this._findInputSink();
+    if (!sink) return;
+    const { element } = sink;
+    this._dispatchKey('Backspace', 'Backspace', 8, element, 'deleteContentBackward');
+  }
+
+  // ── Keyboard pipeline helpers ────────────────────────────────────────────
+  _dispatchChar(char, el) {
+    const charCode  = char.charCodeAt(0);
+    const upperCode = char.toUpperCase().charCodeAt(0);
+    const code      = this._charToCode(char);
+    const shifted   = char !== char.toLowerCase() || '!@#$%^&*()_+{}|:"<>?~'.includes(char);
+    const base = { bubbles: true, composed: true };
+
     el.dispatchEvent(new KeyboardEvent('keydown', {
-      key: char, bubbles: true, cancelable: true, composed: true,
+      ...base, cancelable: true, key: char, code,
+      keyCode: upperCode, charCode: 0, which: upperCode, shiftKey: shifted,
     }));
-    // beforeinput signals the intent to insert; Docs updates its internal model here
-    el.dispatchEvent(new InputEvent('beforeinput', {
-      inputType: 'insertText', data: char,
-      bubbles: true, cancelable: true, composed: true,
+
+    const bi = new InputEvent('beforeinput', {
+      ...base, cancelable: true, inputType: 'insertText', data: char,
+    });
+    const notPrevented = el.dispatchEvent(bi);
+    log(`  beforeinput notPrevented=${notPrevented}`);
+
+    el.dispatchEvent(new KeyboardEvent('keypress', {
+      ...base, cancelable: true, key: char, code,
+      keyCode: charCode, charCode: charCode, which: charCode, shiftKey: shifted,
     }));
-    // execCommand performs the visible DOM insertion
-    const html = styles && Object.keys(styles).some(k => styles[k]) ? tokenToHtml({ char, styles }) : escapeHtml(char);
-    document.execCommand('insertHTML', false, html);
+
     el.dispatchEvent(new InputEvent('input', {
-      inputType: 'insertText', data: char,
-      bubbles: true, composed: true,
+      ...base, inputType: 'insertText', data: char,
     }));
+
     el.dispatchEvent(new KeyboardEvent('keyup', {
-      key: char, bubbles: true, composed: true,
+      ...base, key: char, code,
+      keyCode: upperCode, charCode: 0, which: upperCode, shiftKey: shifted,
     }));
   }
 
-  _simulateEnter(el) {
-    el.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Enter', code: 'Enter', keyCode: 13,
-      bubbles: true, cancelable: true, composed: true,
-    }));
-    el.dispatchEvent(new InputEvent('beforeinput', {
-      inputType: 'insertParagraph',
-      bubbles: true, cancelable: true, composed: true,
-    }));
-    document.execCommand('insertParagraph', false, null);
-    el.dispatchEvent(new InputEvent('input', {
-      inputType: 'insertParagraph', bubbles: true, composed: true,
-    }));
-    el.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Enter', code: 'Enter', keyCode: 13,
-      bubbles: true, composed: true,
-    }));
+  _dispatchEnter(el) {
+    this._dispatchKey('Enter', 'Enter', 13, el, 'insertParagraph');
   }
 
-  backspace(el) {
-    const editor = this._findEditor(el);
-    editor.dispatchEvent(new KeyboardEvent('keydown', {
-      key: 'Backspace', code: 'Backspace', keyCode: 8,
-      bubbles: true, cancelable: true, composed: true,
-    }));
-    editor.dispatchEvent(new InputEvent('beforeinput', {
-      inputType: 'deleteContentBackward',
-      bubbles: true, cancelable: true, composed: true,
-    }));
-    document.execCommand('delete', false, null);
-    editor.dispatchEvent(new InputEvent('input', {
-      inputType: 'deleteContentBackward', bubbles: true, composed: true,
-    }));
-    editor.dispatchEvent(new KeyboardEvent('keyup', {
-      key: 'Backspace', code: 'Backspace', keyCode: 8,
-      bubbles: true, composed: true,
-    }));
+  _dispatchKey(key, code, keyCode, el, inputType) {
+    const base = { bubbles: true, composed: true };
+    el.dispatchEvent(new KeyboardEvent('keydown',  { ...base, cancelable: true, key, code, keyCode, charCode: 0, which: keyCode }));
+    el.dispatchEvent(new InputEvent('beforeinput', { ...base, cancelable: true, inputType }));
+    el.dispatchEvent(new InputEvent('input',       { ...base, inputType }));
+    el.dispatchEvent(new KeyboardEvent('keyup',    { ...base, key, code, keyCode, charCode: 0, which: keyCode }));
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  _selectionOffset(doc) {
+    try {
+      const sel = doc.getSelection ? doc.getSelection() : window.getSelection();
+      if (sel && sel.rangeCount) return sel.getRangeAt(0).startOffset;
+    } catch (_) {}
+    return null;
+  }
+
+  _charToCode(char) {
+    const lower = char.toLowerCase();
+    if (lower >= 'a' && lower <= 'z') return `Key${lower.toUpperCase()}`;
+    if (char >= '0' && char <= '9')   return `Digit${char}`;
+    return {
+      ' ': 'Space', '.': 'Period',  ',': 'Comma',   '-': 'Minus',
+      '=': 'Equal', '[': 'BracketLeft', ']': 'BracketRight',
+      ';': 'Semicolon', "'": 'Quote', '/': 'Slash',
+      '\\': 'Backslash', '`': 'Backquote',
+    }[char] || '';
   }
 }
 
@@ -525,13 +692,21 @@ document.addEventListener('paste', (e) => {
 
   let target = document.activeElement;
 
-  // Google Docs may not report the editor as activeElement; locate it explicitly
-  if (isGoogleDocs() && !isTypable(target)) {
-    const docsEditor = document.querySelector('[contenteditable="true"]');
-    if (docsEditor) target = docsEditor;
+  if (isGoogleDocs()) {
+    // When Docs is focused, activeElement is often the docs-texteventtarget-iframe itself.
+    // Drill into it to get the actual editable sink, or just pass a sentinel — the
+    // GoogleDocsStrategy will locate the real sink via _findInputSink() anyway.
+    if (target && target.tagName === 'IFRAME') {
+      try {
+        const inner = target.contentDocument?.activeElement;
+        if (inner && inner !== target.contentDocument.body) target = inner;
+      } catch (_) {}
+    }
+    // Even if target is still the iframe or body, proceed: strategy handles discovery.
+    log('Docs paste: activeElement =', target?.tagName, target?.className?.slice(0, 50));
+  } else {
+    if (!isTypable(target)) return;
   }
-
-  if (!isTypable(target)) return;
 
   e.preventDefault();
   e.stopPropagation();
@@ -542,7 +717,7 @@ document.addEventListener('paste', (e) => {
   const textData = e.clipboardData.getData('text/plain');
 
   let tokens;
-  if (htmlData && (target.isContentEditable || isGoogleDocs())) {
+  if (htmlData && (isGoogleDocs() || target?.isContentEditable)) {
     tokens = parseHtmlToTokens(htmlData);
     log(`HTML clipboard parsed → ${tokens.length} tokens`);
   } else {
@@ -582,3 +757,19 @@ document.addEventListener('keydown', (e) => {
     });
   }
 }, { capture: true });
+
+// ─── Dev helpers (accessible from DevTools console) ──────────────────────────
+// window._autoTypeDebug = true   — enable on-page debug panel + verbose logging
+// window._autoTypeDiag()         — dump full Docs input-sink diagnostics to console
+// window._autoTypeDebug = false  — hide debug panel
+window._autoTypeDiag = () => {
+  window._autoTypeDebug = true;
+  if (isGoogleDocs()) {
+    log('Running Docs diagnostics…');
+    new GoogleDocsStrategy().logDiagnostics();
+  } else {
+    log('Not on Google Docs');
+    log('activeElement:', document.activeElement?.tagName, document.activeElement?.className?.slice(0, 70));
+    log('All contenteditable:', [...document.querySelectorAll('[contenteditable]')].map(el => `${el.tagName}.${el.className?.slice(0,30)}`));
+  }
+};
