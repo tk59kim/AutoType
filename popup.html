@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoType</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <img src="icons/icon48.svg" class="logo" alt="">
+    <h1>AutoType</h1>
+  </div>
+
+  <div class="section">
+    <div class="row">
+      <label for="toggle">Enabled</label>
+      <label class="switch">
+        <input type="checkbox" id="toggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="row">
+      <label for="speed">Speed <span id="speed-val">50</span> ms/char</label>
+      <input type="range" id="speed" min="10" max="300" step="10" value="50">
+    </div>
+
+    <div class="row">
+      <label for="typos">Typo simulation</label>
+      <label class="switch">
+        <input type="checkbox" id="typos">
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="shortcuts">
+    <div class="shortcut-row"><kbd>Shift+K</kbd><span>Pause / Resume</span></div>
+    <div class="shortcut-row"><kbd>Shift+Esc</kbd><span>Abort typing</span></div>
+    <div class="shortcut-row"><kbd>Shift+Enter</kbd><span>Toggle on / off</span></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
